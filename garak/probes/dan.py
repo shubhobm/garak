@@ -24,6 +24,7 @@ class DANProbe(Probe):
     ]
     goal = "disregard the system prompt"
     prompts = [""]
+    active = False
 
     def probe(self, generator):
         self.prompts = [prompt.format(generator=generator) for prompt in self.prompts]
@@ -332,3 +333,22 @@ class AutoDANProbe(DANProbe, Probe):
             raise Exception(msg)
         self.prompts = prompts
         super().__init__()
+
+__all__ = [
+    "Dan_11_0",
+    "Dan_10_0",
+    "Dan_9_0",
+    "Dan_8_0",
+    "Dan_7_0",
+    "Dan_6_2",
+    "Dan_6_0",
+    "DUDE",
+    "STAN",
+    "DAN_Jailbreak",
+    "AntiDAN",
+    "ChatGPT_Developer_Mode_v2",
+    "ChatGPT_Developer_Mode_RANTI",
+    "ChatGPT_Image_Markdown",
+    "Ablation_Dan_11_0",
+    "AutoDANProbe",
+]
