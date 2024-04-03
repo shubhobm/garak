@@ -19,10 +19,11 @@ import logging
 from math import log
 import re
 import os
-from typing import List
+from typing import List, Union
 import warnings
 
 import backoff
+import torch
 
 from garak import _config
 from garak.generators.base import Generator
@@ -61,7 +62,7 @@ class Pipeline(Generator):
 
         import torch.cuda
 
-        if torch.cuda.is_available() == False:
+        if not torch.cuda.is_available():
             logging.debug("Using CPU, torch.cuda.is_available() returned False")
             device = -1
 
@@ -80,20 +81,21 @@ class Pipeline(Generator):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=UserWarning)
             try:
-                # workaround for pipeline to truncate the input
-                encoded_prompt = self.generator.tokenizer(prompt, truncation=True)
-                truncated_prompt = self.generator.tokenizer.decode(
-                    encoded_prompt["input_ids"], skip_special_tokens=True
-                )
-                raw_output = self.generator(
-                    truncated_prompt,
-                    pad_token_id=self.generator.tokenizer.eos_token_id,
-                    max_new_tokens=self.max_tokens,
-                    num_return_sequences=self.generations,
-                    # max_length = 1024,
-                )
-            except Exception:
-                raw_output = []  # could handle better than this..
+                with torch.no_grad():
+                    # workaround for pipeline to truncate the input
+                    encoded_prompt = self.generator.tokenizer(prompt, truncation=True)
+                    truncated_prompt = self.generator.tokenizer.decode(
+                        encoded_prompt["input_ids"], skip_special_tokens=True
+                    )
+                    raw_output = self.generator(
+                        truncated_prompt,
+                        pad_token_id=self.generator.tokenizer.eos_token_id,
+                        max_new_tokens=self.max_tokens,
+                        num_return_sequences=self.generations
+                    )
+            except Exception as e:
+                logging.error(e)
+                raw_output = []  # could handle better than this
 
         if raw_output is not None:
             generations = [
@@ -128,7 +130,7 @@ class OptimumPipeline(Pipeline):
 
         import torch.cuda
 
-        if torch.cuda.is_available() is False:
+        if not torch.cuda.is_available():
             message = "OptimumPipeline needs CUDA, but torch.cuda.is_available() returned False; quitting"
             logging.critical(message)
             raise ValueError(message)
@@ -149,6 +151,75 @@ class OptimumPipeline(Pipeline):
         if _config.loaded:
             if _config.run.deprefix is True:
                 self.deprefix_prompt = True
+
+
+class ConversationalPipeline(Generator):
+    """Conversational text generation using HuggingFace pipelines"""
+
+    generator_family_name = "Hugging Face 🤗 pipeline for conversations"
+    supports_multiple_generations = True
+
+    def __init__(self, name, do_sample=True, generations=10, device=0):
+        self.fullname, self.name = name, name.split("/")[-1]
+
+        super().__init__(name, generations=generations)
+
+        from transformers import pipeline, set_seed, Conversation
+
+        if _config.run.seed is not None:
+            set_seed(_config.run.seed)
+
+        import torch.cuda
+
+        if not torch.cuda.is_available():
+            logging.debug("Using CPU, torch.cuda.is_available() returned False")
+            device = -1
+
+        # Note that with pipeline, in order to access the tokenizer, model, or device, you must get the attribute
+        # directly from self.generator instead of from the ConversationalPipeline object itself.
+        self.generator = pipeline(
+            "conversational",
+            model=name,
+            do_sample=do_sample,
+            device=device,
+        )
+        self.conversation = Conversation()
+        self.deprefix_prompt = name in models_to_deprefix
+        if _config.loaded:
+            if _config.run.deprefix is True:
+                self.deprefix_prompt = True
+
+    def clear_history(self):
+        from transformers import Conversation
+        self.conversation = Conversation()
+
+    def _call_model(self, prompt: Union[str, list[dict]]) -> List[str]:
+        """Take a conversation as a list of dictionaries and feed it to the model"""
+
+        # If conversation is provided as a list of dicts, create the conversation.
+        # Otherwise, maintain state in Generator
+        if isinstance(prompt, str):
+            self.conversation.add_message({"role": "user", "content": prompt})
+            self.conversation = self.generator(self.conversation)
+            generations = [self.conversation[-1]["content"]]
+
+        elif isinstance(prompt, list):
+            from transformers import Conversation
+
+            conversation = Conversation()
+            for item in prompt:
+                conversation.add_message(item)
+            with torch.no_grad():
+                conversation = self.generator(conversation)
+
+            generations = [conversation[-1]["content"]]
+        else:
+            raise TypeError(f"Expected list or str, got {type(prompt)}")
+
+        if not self.deprefix_prompt:
+            return generations
+        else:
+            return [re.sub("^" + re.escape(prompt), "", i) for i in generations]
 
 
 class InferenceAPI(Generator):
@@ -342,7 +413,7 @@ class Model(Generator):
         self.init_device = "cuda:" + str(self.device)
         import torch.cuda
 
-        if torch.cuda.is_available() == False:
+        if not torch.cuda.is_available():
             logging.debug("Using CPU, torch.cuda.is_available() returned False")
             self.device = -1
             self.init_device = "cpu"
@@ -391,22 +462,23 @@ class Model(Generator):
         text_output = []
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=UserWarning)
-            inputs = self.tokenizer(prompt, truncation=True, return_tensors="pt").to(
-                self.init_device
-            )
-
-            try:
-                outputs = self.model.generate(
-                    **inputs, generation_config=self.generation_config
+            with torch.no_grad():
+                inputs = self.tokenizer(prompt, truncation=True, return_tensors="pt").to(
+                    self.init_device
                 )
-            except IndexError as e:
-                if len(prompt) == 0:
-                    return [""] * self.generations
-                else:
-                    raise e
-            text_output = self.tokenizer.batch_decode(
-                outputs, skip_special_tokens=True, device=self.device
-            )
+
+                try:
+                    outputs = self.model.generate(
+                        **inputs, generation_config=self.generation_config
+                    )
+                except IndexError as e:
+                    if len(prompt) == 0:
+                        return [""] * self.generations
+                    else:
+                        raise e
+                text_output = self.tokenizer.batch_decode(
+                    outputs, skip_special_tokens=True, device=self.device
+                )
 
         if not self.deprefix_prompt:
             return text_output
