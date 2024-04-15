@@ -3,6 +3,7 @@
 
 import copy
 import re
+import torch.cuda
 from tqdm import tqdm
 from logging import getLogger
 from typing import Union, Optional
@@ -17,10 +18,17 @@ from .utils import (
     extract_json,
 )
 from .system_prompts import attacker_system_prompt, on_topic_prompt, judge_system_prompt
-from .generator_utils import load_generator, supported_openai, supported_huggingface
+from .generator_utils import (
+    load_generator,
+    supported_openai,
+    supported_huggingface,
+    token_count,
+    get_token_limit,
+)
 
 import garak.generators
 import garak._config
+from garak.generators.huggingface import Model
 
 logger = getLogger(__name__)
 SAVE_RESULTS = True
@@ -65,6 +73,7 @@ class AttackManager:
         self.target_max_tokens = target_max_tokens
         self.evaluator_max_tokens = evaluator_max_tokens
         self.evaluator_temperature = evaluator_temperature
+        self.evaluator_token_limit = get_token_limit(evaluation_generator.name)
         self.system_prompt_judge = judge_system_prompt(goal)
         self.system_prompt_on_topic = on_topic_prompt(goal)
 
@@ -101,7 +110,7 @@ class AttackManager:
         for conv, prompt in zip(convs, prompts):
             conv.append_message(conv.roles[0], prompt)
             # Get prompts
-            if "gpt" in self.attack_generator.name:
+            if not isinstance(self.attack_generator, Model):
                 full_prompts.append(conv.to_openai_api_messages())
             else:
                 conv.append_message(conv.roles[1], init_message)
@@ -121,16 +130,25 @@ class AttackManager:
                     continue
 
                 for full_prompt in full_prompts_subset[left:right]:
-                    outputs_list.append(self.attack_generator.generate(full_prompt))
+                    # We should fail more gracefully within runs for garak.
+                    try:
+                        outputs_list.append(
+                            self.attack_generator.generate(full_prompt)[0]
+                        )
+                    except torch.cuda.OutOfMemoryError as e:
+                        if len(outputs_list) > 0:
+                            break
+                        else:
+                            logger.critical("CUDA OOM during TAP generation")
+                            raise e
 
             # Check for valid outputs and update the list
             new_indices_to_regenerate = []
-            for i, full_output in enumerate([o for o in outputs_list if o is not None]):
+            for i, full_output in enumerate(outputs_list):
                 orig_index = indices_to_regenerate[i]
 
-                if "gpt" not in self.attack_generator.name:
+                if not isinstance(self.attack_generator, Model):
                     full_output = init_message + full_output
-
                 attack_dict, json_str = extract_json(full_output)
 
                 if attack_dict is not None:
@@ -173,14 +191,13 @@ class AttackManager:
         full_prompts = []
         for conv, prompt in zip(convs_list, prompts):
             conv.append_message(conv.roles[0], prompt)
-            if "gpt" in self.target_generator.name:
+            if not isinstance(self.attack_generator, Model):
                 # OpenAI does not have separators
                 full_prompts.append(conv.to_openai_api_messages())
             else:
                 conv.append_message(conv.roles[1], None)
                 full_prompts.append(conv.get_prompt())
 
-        # Query the attack LLM in batched-queries with at most MAX_PARALLEL_STREAMS-many queries at a time
         outputs_list = []
         for left in range(0, len(full_prompts), self.max_parallel_streams):
             right = min(left + self.max_parallel_streams, len(full_prompts))
@@ -233,6 +250,35 @@ class AttackManager:
 
         conv = get_template(self.evaluation_generator.name)
         conv.set_system_message(system_prompt)
+        # Avoid sending overly long prompts.
+        # Crude and fast heuristic -- 100 tokens is about 75 words
+        if len(full_prompt.split()) / 0.75 > self.evaluator_token_limit:
+            # More expensive check yielding actual information -- add 100 token buffer to prompt
+            judge_system_prompt_tokens = token_count(
+                system_prompt, self.evaluation_generator.name
+            )
+            prompt_tokens = 100 + token_count(
+                full_prompt, self.evaluation_generator.name
+            )
+            # Iteratively reduce the prompt length
+            while (
+                judge_system_prompt_tokens + prompt_tokens >= self.evaluator_token_limit
+            ):
+                excess_tokens = (
+                    judge_system_prompt_tokens
+                    + prompt_tokens
+                    - self.evaluator_token_limit
+                )
+                if excess_tokens > 0:
+                    # Truncate excess text
+                    excess_words = int(excess_tokens / 0.75)
+                    full_prompt = full_prompt[excess_words:]
+                    prompt_tokens = 100 + token_count(
+                        full_prompt, self.evaluation_generator.name
+                    )
+                else:
+                    break
+
         conv.append_message(conv.roles[0], full_prompt)
 
         return conv.to_openai_api_messages()
@@ -272,7 +318,7 @@ def run_tap(
     target: str,
     target_generator: garak.generators.Generator,
     target_max_tokens: int = 150,
-    attack_model: str = "lmsys/vicuna-13b-v1.3",
+    attack_model: str = "lmsys/vicuna-7b-v1.3",
     attack_max_tokens: int = 500,
     attack_max_attempts: int = 5,
     attack_device: Optional[Union[int, str]] = 1,
@@ -287,7 +333,7 @@ def run_tap(
     pruning: bool = True,
     save_results: bool = SAVE_RESULTS,
     outfile: str = garak._config.transient.basedir
-    / "resources/data/tap_jailbreaks.txt",
+    / "resources/tap/data/tap_jailbreaks.txt",
 ):
     """
     Function for generating attacks using TAP where a generator has already been instantiated.
@@ -322,7 +368,7 @@ def run_tap(
 
     if (
         target_generator.name not in supported_openai
-        or target_generator.name not in supported_huggingface
+        and target_generator.name not in supported_huggingface
     ):
         save_results = False
 
@@ -355,6 +401,7 @@ def run_tap(
         target_max_tokens=target_max_tokens,
         evaluator_max_tokens=evaluator_max_tokens,
         evaluator_temperature=evaluator_temperature,
+        max_parallel_streams=n_streams,
     )
 
     # Initialize conversations
@@ -362,7 +409,7 @@ def run_tap(
     init_msg = get_init_msg(goal, target)
     processed_response_list = [init_msg for _ in range(batch_size)]
     convs_list = [
-        get_template(attack_generator.name, self_id="NA", parent_id="NA")
+        get_template(attack_model, self_id="NA", parent_id="NA")
         for _ in range(batch_size)
     ]
 
@@ -497,10 +544,10 @@ def run_tap(
 def generate_tap(
     goal: str,
     target: str,
-    attack_model: str = "lmsys/vicuna-13b-v1.3",
+    attack_model: str = "lmsys/vicuna-7b-v1.3",
     attack_max_tokens: int = 500,
     attack_max_attempts: int = 5,
-    target_model: str = "lmsys/vicuna-13b-v1.3",
+    target_model: str = "lmsys/vicuna-7b-v1.3",
     target_max_tokens: int = 150,
     evaluator_model: str = "gpt-3.5-turbo",
     evaluator_max_tokens: int = 10,
@@ -512,7 +559,7 @@ def generate_tap(
     keep_last_n: int = 1,
     save_results: bool = SAVE_RESULTS,
     outfile: str = garak._config.transient.basedir
-    / "resources/data/tap_jailbreaks.txt",
+    / "resources/tap/data/tap_jailbreaks.txt",
 ):
     """
     Function for generating attacks using TAP when a generator has not been instantiated.
