@@ -18,6 +18,7 @@ from typing import List, Union
 import openai
 import backoff
 
+from garak.exception import APIKeyMissingError
 from garak.generators.base import Generator
 
 # lists derived from https://platform.openai.com/docs/models
@@ -86,6 +87,7 @@ class OpenAICompatible(Generator):
     """Generator base class for OpenAI compatible text2text restful API. Implements shared initialization and execution methods."""
 
     ENV_VAR = "OpenAICompatible_API_KEY".upper()  # Placeholder override when extending
+    active = False  # this interface class is not active
 
     supports_multiple_generations = True
     generator_family_name = "OpenAICompatible"  # Placeholder override when extending
@@ -97,6 +99,16 @@ class OpenAICompatible(Generator):
     presence_penalty = 0.0
     stop = ["#", ";"]
 
+    # avoid attempt to pickle the client attribute
+    def __getstate__(self) -> object:
+        self._clear_client()
+        return dict(self.__dict__)
+
+    # restore the client attribute
+    def __setstate__(self, d) -> object:
+        self.__dict__.update(d)
+        self._load_client()
+
     def _load_client(self):
         # Required stub implemented when extending `OpenAICompatible`
         raise NotImplementedError
@@ -105,37 +117,26 @@ class OpenAICompatible(Generator):
         # Required stub implemented when extending `OpenAICompatible`
         raise NotImplementedError
 
+    def _validate_config(self):
+        pass
+
     def __init__(self, name, generations=10):
         self.name = name
         self.fullname = f"{self.generator_family_name} {self.name}"
 
-        super().__init__(name, generations=generations)
-
         self.api_key = os.getenv(self.ENV_VAR, default=None)
         if self.api_key is None:
-            raise ValueError(
+            raise APIKeyMissingError(
                 f'Put the {self.generator_family_name} API key in the {self.ENV_VAR} environment variable (this was empty)\n \
                 e.g.: export {self.ENV_VAR}="sk-123XXXXXXXXXXXX"'
             )
 
         self._load_client()
 
-        if self.name in context_lengths:
-            self.context_len = context_lengths[self.name]
+        self._validate_config()
 
-        elif self.name == "":
-            openai_model_list = sorted([m.id for m in self.client.models.list().data])
-            raise ValueError(
-                f"Model name is required for {self.generator_family_name}, use --model_name\n"
-                + "  API returns following available models: ▶️   "
-                + "  ".join(openai_model_list)
-                + "\n"
-                + "  ⚠️  Not all these are text generation models"
-            )
-        else:
-            raise ValueError(
-                f"No {self.generator_family_name} API defined for '{self.name}' in generators/openai.py - please add one!"
-            )
+        super().__init__(name, generations=generations)
+
         # clear client config to enable object to `pickle`
         self._clear_client()
 
@@ -145,15 +146,14 @@ class OpenAICompatible(Generator):
         (
             openai.RateLimitError,
             openai.InternalServerError,
-            openai.APIError,
             openai.APITimeoutError,
             openai.APIConnectionError,
         ),
         max_value=70,
     )
     def _call_model(
-        self, prompt: Union[str, list[dict]], generations_this_call: int = 1
-    ) -> List[str]:
+        self, prompt: Union[str, List[dict]], generations_this_call: int = 1
+    ) -> List[Union[str, None]]:
         if self.client is None:
             # reload client once when consuming the generator
             self._load_client()
@@ -217,9 +217,20 @@ class OpenAIGenerator(OpenAICompatible):
 
     ENV_VAR = "OPENAI_API_KEY"
     generator_family_name = "OpenAI"
+    active = True
 
     def _load_client(self):
         self.client = openai.OpenAI(api_key=self.api_key)
+
+        if self.name == "":
+            openai_model_list = sorted([m.id for m in self.client.models.list().data])
+            raise ValueError(
+                f"Model name is required for {self.generator_family_name}, use --model_name\n"
+                + "  API returns following available models: ▶️   "
+                + "  ".join(openai_model_list)
+                + "\n"
+                + "  ⚠️  Not all these are text generation models"
+            )
 
         if self.name in completion_models:
             self.generator = self.client.completions
@@ -229,10 +240,20 @@ class OpenAIGenerator(OpenAICompatible):
             r"^.+-[01][0-9][0-3][0-9]$", self.name
         ):  # handle model names -MMDDish suffix
             self.generator = self.client.completions
+        else:
+            raise ValueError(
+                f"No {self.generator_family_name} API defined for '{self.name}' in generators/openai.py - please add one!"
+            )
 
     def _clear_client(self):
         self.generator = None
         self.client = None
 
+    def __init__(self, name):
+        if self.name in context_lengths:
+            self.context_len = context_lengths[self.name]
 
-default_class = "OpenAIGenerator"
+        super().__init__(name)
+
+
+DEFAULT_CLASS = "OpenAIGenerator"

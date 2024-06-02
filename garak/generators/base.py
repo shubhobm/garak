@@ -28,10 +28,7 @@ class Generator:
     # support mainstream any-to-any large models
     # legal element for str list `modality['in']`: 'text', 'image', 'audio', 'video', '3d'
     # refer to Table 1 in https://arxiv.org/abs/2401.13601
-    modality: dict = {
-        'in': {'text'}, 
-        'out': {'text'} 
-    }
+    modality: dict = {"in": {"text"}, "out": {"text"}}
 
     supports_multiple_generations = (
         False  # can more than one generation be extracted per request?
@@ -57,7 +54,7 @@ class Generator:
 
     def _call_model(
         self, prompt: str, generations_this_call: int = 1
-    ) -> Union[List[str], str, None]:
+    ) -> List[Union[str, None]]:
         """Takes a prompt and returns an API output
 
         _call_api() is fully responsible for the request, and should either
@@ -73,7 +70,9 @@ class Generator:
     def clear_history(self):
         pass
 
-    def generate(self, prompt: str, generations_this_call: int = -1) -> List[str]:
+    def generate(
+        self, prompt: str, generations_this_call: int = -1
+    ) -> List[Union[str, None]]:
         """Manages the process of getting generations out from a prompt
 
         This will involve iterating through prompts, getting the generations
@@ -95,11 +94,11 @@ class Generator:
             logging.debug("generate() called with generations_this_call = 0")
             return []
 
-        if self.supports_multiple_generations:
-            return self._call_model(prompt, generations_this_call)
+        if generations_this_call == 1:
+            outputs = self._call_model(prompt, 1)
 
-        elif generations_this_call <= 1:
-            return [self._call_model(prompt, generations_this_call)]
+        if self.supports_multiple_generations:
+            outputs = self._call_model(prompt, generations_this_call)
 
         else:
             outputs = []
@@ -127,11 +126,18 @@ class Generator:
                 )
                 generation_iterator.set_description(self.fullname[:55])
                 for i in generation_iterator:
-                    outputs.append(self._call_model(prompt, generations_this_call))
+                    output_one = self._call_model(
+                        prompt, 1
+                    )  # generate once as `generation_iterator` consumes `generations_this_call`
+                    assert isinstance(
+                        output_one, list
+                    ), "_call_model must return a list"
+                    assert (
+                        len(output_one) == 1
+                    ), "_call_model must return a list of one item when invoked as _call_model(prompt, 1)"
+                    assert (
+                        isinstance(output_one[0], str) or output_one[0] is None
+                    ), "_call_model's item must be a string or None"
+                    outputs.append(output_one[0])
 
-            cleaned_outputs = [
-                o for o in outputs if o is not None
-            ]  # "None" means no good response
-            outputs = cleaned_outputs
-
-            return outputs
+        return outputs
